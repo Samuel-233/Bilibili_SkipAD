@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         跳过B站广告
 // @namespace    http://tampermonkey.net/
-// @version      0.8
-// @description  P:跳转到当前时间后(且忽略前个P点后3s)的最高峰。O:跳转到"O周期内首次P按下时"的位置,并重置P链。
+// @version      0.8.3
+// @description  P:跳转到当前时间后(且忽略前个P点后3s)的最高峰。O:跳转到"O周期内首次P按下时"的位置,并重置P链。视频变更检测基于标题。
 // @author       Samuel233
 // @match        https://www.bilibili.com/video/*
 // @grant        unsafeWindow
@@ -15,21 +15,18 @@
     let bpxPlayer = null;
     let pKeyCooldownUntil = 0;
 
-    // --- State Variables for O/P Logic ---
-    let targetTimeForOJump = null;         // O键将要跳转到的时间点
-    let isNextPFirstInOCycle = true;      // 标记下一个P是否为O周期内的第一个P
-    // let baseTimeForPChainStart_SetByO = 0; // v0.8中不再需要此变量 for P's search start
-    let lastSuccessfulPJumpTime = -1;      // 上一次P键成功跳转到的实际时间点
-
-    // --- State Variables for Heatmap Data ---
+    // --- State Variables ---
+    let targetTimeForOJump = null;
+    let isNextPFirstInOCycle = true;
+    let lastSuccessfulPJumpTime = -1;
     let sortedHeatmapPeaks = [];
     let heatmapDataReady = false;
-    let lastKnownCid = null;
+    let lastKnownTitle = null; // 改用标题跟踪当前视频
 
     const P_KEY_COOLDOWN_MS = 1000;
     const P_IGNORE_DURATION_S = 3.0;
 
-    console.log("Bilibili 热度跳转脚本已加载 v0.8 by Samuel233。");
+    console.log("Bilibili 热度跳转脚本已加载 v0.8.3 by Samuel233。视频变更检测基于标题。");
 
     function getBilibiliPlayer() {
         if (bpxPlayer && typeof bpxPlayer.seek === 'function' && typeof bpxPlayer.getCurrentTime === 'function') {
@@ -48,9 +45,7 @@
             if (typeof bpxPlayer.getDuration !== 'function' && typeof bpxPlayer.duration === 'number') {
                  bpxPlayer.getDuration = function() { return this.duration; };
             }
-            if (typeof bpxPlayer.seek === 'function' && typeof bpxPlayer.getCurrentTime === 'function') {
-                // console.log("Bilibili 播放器对象已找到:", bpxPlayer);
-            } else {
+            if (!(typeof bpxPlayer.seek === 'function' && typeof bpxPlayer.getCurrentTime === 'function')) {
                 console.warn("播放器对象不完整或不符合预期。");
                 bpxPlayer = null;
             }
@@ -85,30 +80,69 @@
         return points;
     }
 
+    function getCurrentVideoTitle() {
+        const titleElement = document.querySelector('h1.video-title'); // 基于用户截图
+        if (titleElement) {
+            // 优先使用 data-title 或 title 属性，它们可能更干净
+            return titleElement.getAttribute('data-title') || titleElement.title || titleElement.textContent.trim();
+        }
+        // 备用选择器 (如果上面那个失效)
+        const altTitleElement = document.querySelector('.video-info .tit') || document.querySelector('.video-data .video-title');
+        if (altTitleElement) {
+            return altTitleElement.textContent.trim();
+        }
+        console.warn("未能获取到视频标题元素。");
+        return null;
+    }
+
+    function resetScriptStateForNewVideo(newTitle) {
+        console.log(`检测到视频变更 (或强制重置)。旧标题: "${lastKnownTitle}", 新标题: "${newTitle}". 重置所有交互状态。`);
+        heatmapDataReady = false;
+        sortedHeatmapPeaks = [];
+        targetTimeForOJump = null;
+        isNextPFirstInOCycle = true;
+        lastSuccessfulPJumpTime = -1;
+        lastKnownTitle = newTitle; // 更新最后已知的标题
+    }
+
     async function fetchAndProcessAllHeatmapData() {
         const player = getBilibiliPlayer();
         if (!player) { console.warn("播放器未准备好，无法获取热度数据。"); return false; }
 
-        const currentCid = unsafeWindow.cid || (player.getVideoBasicInfo && player.getVideoBasicInfo().cid);
-        if (lastKnownCid !== null && currentCid !== lastKnownCid) {
-            console.log("检测到视频变更，重置所有相关状态。");
-            heatmapDataReady = false; sortedHeatmapPeaks = [];
-            targetTimeForOJump = null; isNextPFirstInOCycle = true;
-            // baseTimeForPChainStart_SetByO = 0; // No longer used
-            lastSuccessfulPJumpTime = -1;
+        const currentVideoTitle = getCurrentVideoTitle();
+
+        if (currentVideoTitle && currentVideoTitle.length > 0) {
+            if (lastKnownTitle !== currentVideoTitle) {
+                resetScriptStateForNewVideo(currentVideoTitle);
+            }
+        } else {
+            console.warn("无法获取当前视频标题，热度数据可能不准确或状态未重置。");
         }
-        lastKnownCid = currentCid;
-        if (heatmapDataReady) return true;
+
+        if (heatmapDataReady) {
+            return true;
+        }
 
         let allHeatmapPoints = [];
+        const currentVideoCid = unsafeWindow.cid || (player.getVideoBasicInfo && player.getVideoBasicInfo().cid); // 仍然尝试获取CID供特定数据源使用
+
+        // --- 数据源获取逻辑 ---
+        if (player.heatmapData && Array.isArray(player.heatmapData) && player.heatmapData.length > 0) { /* ... */ }
+        else if (player.points && Array.isArray(player.points) && player.points.length > 0 && player.points[0].hasOwnProperty('time')) { /* ... */ }
+        if (allHeatmapPoints.length === 0 && typeof unsafeWindow.GrayManager?.getGray === 'function' && currentVideoCid) {
+            try { /* ... GrayManager ... */ } catch (error) { console.error("GrayManager 获取数据出错:", error); }
+        }
+        if (allHeatmapPoints.length === 0) { /* ... SVG ... */ }
+        // (为了简洁，数据源获取的具体实现代码与 v0.8.2 保持一致，这里省略重复部分)
+        // Start Data Acquisition (condensed from v0.8.2)
         if (player.heatmapData && Array.isArray(player.heatmapData) && player.heatmapData.length > 0) {
             allHeatmapPoints = player.heatmapData.map(p => ({ timestamp: p.timestamp, intensity: p.intensity, source: 'player.heatmapData' }));
         } else if (player.points && Array.isArray(player.points) && player.points.length > 0 && player.points[0].hasOwnProperty('time')) {
             allHeatmapPoints = player.points.map(p => ({ timestamp: p.time, intensity: p.value || p.count || 1, source: 'player.points' }));
         }
-        if (allHeatmapPoints.length === 0 && typeof unsafeWindow.GrayManager?.getGray === 'function' && unsafeWindow.cid) {
+        if (allHeatmapPoints.length === 0 && typeof unsafeWindow.GrayManager?.getGray === 'function' && currentVideoCid) { // GrayManager 需要CID
             try {
-                const data = await new Promise(resolve => unsafeWindow.GrayManager.getGray(unsafeWindow.cid, d => resolve(d)));
+                const data = await new Promise(resolve => unsafeWindow.GrayManager.getGray(currentVideoCid, d => resolve(d)));
                 if (data && data.highlight && data.highlight.length > 0) {
                     allHeatmapPoints = data.highlight.map(p => ({ timestamp: p.locate, intensity: p.view, source: 'GrayManager' }));
                 }
@@ -134,6 +168,7 @@
                 }
             }
         }
+        // End Data Acquisition
 
         if (allHeatmapPoints.length === 0) { console.warn("未能获取到任何热度数据源。"); heatmapDataReady = false; return false; }
         const uniquePointsMap = new Map();
@@ -141,8 +176,10 @@
         sortedHeatmapPeaks = Array.from(uniquePointsMap.values()).sort((a, b) => b.intensity - a.intensity);
 
         if (sortedHeatmapPeaks.length > 0) {
-            console.log(`获取并排序了 ${sortedHeatmapPeaks.length} 个热度点。`);
-            heatmapDataReady = true; return true;
+            console.log(`已为视频 "${currentVideoTitle || '未知'}" 获取并排序了 ${sortedHeatmapPeaks.length} 个热度点。`);
+            heatmapDataReady = true;
+            if (currentVideoTitle && currentVideoTitle.length > 0) lastKnownTitle = currentVideoTitle;
+            return true;
         } else {
             console.warn("处理后没有有效的热度点。"); heatmapDataReady = false; return false;
         }
@@ -152,17 +189,20 @@
         const player = getBilibiliPlayer();
         if (!player) { alert("播放器未找到。"); return; }
 
+        const currentVideoTitle = getCurrentVideoTitle();
+        if (currentVideoTitle && currentVideoTitle.length > 0 && lastKnownTitle !== currentVideoTitle) {
+            resetScriptStateForNewVideo(currentVideoTitle);
+        }
+
         if (targetTimeForOJump !== null) {
             player.seek(targetTimeForOJump);
-            console.log(`O键: 跳转到已记录的O周期目标时间点: ${targetTimeForOJump.toFixed(2)}s`);
+            console.log(`O键: 跳转到已记录的O周期目标时间点: ${targetTimeForOJump.toFixed(2)}s (针对视频 "${lastKnownTitle || '未知'}")`);
         } else {
             alert("O键提示: 当前没有已记录的“O周期内首次P点”可供跳转。\n(请在按下此O键后，按一次P键来设定下次O的目标)");
             console.log("O键: targetTimeForOJump 未设置，不执行跳转。");
         }
-
         isNextPFirstInOCycle = true;
-        lastSuccessfulPJumpTime = -1; // O键按下，中断P的连续链条，重置3秒忽略规则的基准
-
+        lastSuccessfulPJumpTime = -1;
         console.log(`O键: 下一个P将设置新的O跳转目标。P链已重置。`);
     }
 
@@ -174,25 +214,27 @@
         const player = getBilibiliPlayer();
         if (!player) { alert("播放器未找到。"); return; }
 
-        const currentTimeForThisPPress = player.getCurrentTime();
-
-        if (isNextPFirstInOCycle) {
-            targetTimeForOJump = currentTimeForThisPPress; // O键的目标点被设定为当前P按下前的时刻
-            isNextPFirstInOCycle = false;
-            console.log(`P键(O周期内首次): O键的下次跳转目标已设置为 ${targetTimeForOJump.toFixed(2)}s`);
+        const currentVideoTitle = getCurrentVideoTitle();
+        if (currentVideoTitle && currentVideoTitle.length > 0 && lastKnownTitle !== currentVideoTitle) {
+            resetScriptStateForNewVideo(currentVideoTitle);
         }
 
-        const currentCidCheck = unsafeWindow.cid || (player.getVideoBasicInfo && player.getVideoBasicInfo().cid);
-        if (currentCidCheck && lastKnownCid !== null && currentCidCheck !== lastKnownCid) { heatmapDataReady = false; }
+        const timeWhenPKeyWasPressed = player.getCurrentTime();
+
+        if (isNextPFirstInOCycle) {
+            targetTimeForOJump = timeWhenPKeyWasPressed;
+            isNextPFirstInOCycle = false;
+            console.log(`P键(O周期内首次): O键的下次跳转目标已设置为 ${targetTimeForOJump.toFixed(2)}s (视频 "${lastKnownTitle || '未知'}")`);
+        }
+
         if (!heatmapDataReady) {
             const success = await fetchAndProcessAllHeatmapData();
             if (!success) { alert("初始化热度数据失败，无法执行 P 键操作。"); return; }
         }
-        if (sortedHeatmapPeaks.length === 0) { alert("没有可用的热度峰值数据。"); return; }
+        if (sortedHeatmapPeaks.length === 0) { alert("没有可用的热度峰值数据 (针对当前视频)。"); return; }
 
-        // P键的搜索起点固定为当前的播放时间
-        const searchReferenceTime = currentTimeForThisPPress;
-        console.log(`P键: 搜索参考时间点 (当前播放时间): ${searchReferenceTime.toFixed(2)}s`);
+        const searchReferenceTime = player.getCurrentTime();
+        console.log(`P键: 搜索参考时间点 (搜索前精确播放时间): ${searchReferenceTime.toFixed(2)}s`);
 
         const ignorePeaksUpTo = (lastSuccessfulPJumpTime !== -1) ? (lastSuccessfulPJumpTime + P_IGNORE_DURATION_S) : -1;
         if (ignorePeaksUpTo !== -1) {
@@ -201,8 +243,8 @@
 
         let foundPeakToJump = null;
         for (const peak of sortedHeatmapPeaks) {
-            if (peak.timestamp > searchReferenceTime) { // 条件1: 必须在参考点(当前P按下时的时间)之后
-                if (peak.timestamp > ignorePeaksUpTo) { // 条件2: 必须在3秒忽略区之后
+            if (peak.timestamp > searchReferenceTime) {
+                if (peak.timestamp > ignorePeaksUpTo) {
                     foundPeakToJump = peak;
                     break;
                 }
@@ -210,14 +252,12 @@
         }
 
         if (foundPeakToJump) {
-            console.log(`P键: 找到有效峰值 T=${foundPeakToJump.timestamp.toFixed(2)}s (强度 ${foundPeakToJump.intensity.toFixed(2)})。跳转前位置: ${currentTimeForThisPPress.toFixed(2)}s`);
+            console.log(`P键: 找到有效峰值 T=${foundPeakToJump.timestamp.toFixed(2)}s (强度 ${foundPeakToJump.intensity.toFixed(2)})。跳转前精确参考位置: ${searchReferenceTime.toFixed(2)}s`);
             player.seek(foundPeakToJump.timestamp);
             lastSuccessfulPJumpTime = foundPeakToJump.timestamp;
         } else {
             alert(`在 T=${searchReferenceTime.toFixed(2)}s 之后 (并考虑 ${P_IGNORE_DURATION_S.toFixed(1)}s 忽略规则) 未找到符合条件的热度峰值。`);
             console.log(`P键: 未找到符合条件的峰值。`);
-            // 如果P键未找到跳转点, lastSuccessfulPJumpTime 保持不变。
-            // 下一次P键仍会从当前播放时间开始搜索，但3秒忽略规则会基于上一次 *成功* 的P点。
         }
     }
 
@@ -230,14 +270,25 @@
     });
 
     setTimeout(() => {
-        const player = getBilibiliPlayer();
-        if (player) {
-            const currentCid = unsafeWindow.cid || (player.getVideoBasicInfo && player.getVideoBasicInfo().cid);
-            if (currentCid) { lastKnownCid = currentCid; }
-            if (!heatmapDataReady) {
-                console.log("脚本加载3秒后，尝试预获取热度数据...");
-                fetchAndProcessAllHeatmapData();
+        // console.log("脚本初始化 setTimeout 执行");
+        const player = getBilibiliPlayer(); // 尝试获取播放器，但主要目的是获取标题
+        let initialVideoTitle = getCurrentVideoTitle();
+
+        if (initialVideoTitle && initialVideoTitle.length > 0) {
+            if (lastKnownTitle === null) {
+                lastKnownTitle = initialVideoTitle;
+                console.log(`脚本初始化：记录初始标题 = "${lastKnownTitle}"`);
+            } else if (lastKnownTitle !== initialVideoTitle) {
+                // 如果在脚本注入到此setTimeout之间标题就变了
+                resetScriptStateForNewVideo(initialVideoTitle);
             }
+        } else {
+            console.log("脚本初始化：未能获取到初始视频标题。");
+        }
+
+        if (lastKnownTitle && !heatmapDataReady) { // 如果标题已知，且数据未准备好
+             console.log("脚本加载3秒后，为当前标题尝试预获取热度数据...");
+             fetchAndProcessAllHeatmapData();
         }
     }, 3000);
 
